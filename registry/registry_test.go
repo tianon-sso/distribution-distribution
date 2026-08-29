@@ -2,6 +2,8 @@ package registry
 
 import (
 	"bufio"
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto"
 	"crypto/ecdsa"
@@ -17,6 +19,8 @@ import (
 	"math/big"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"os"
 	"path"
 	"reflect"
@@ -27,6 +31,7 @@ import (
 	"github.com/distribution/distribution/v3/configuration"
 	"github.com/distribution/distribution/v3/internal/dcontext"
 	_ "github.com/distribution/distribution/v3/registry/storage/driver/inmemory"
+	"github.com/opencontainers/go-digest"
 	"github.com/sirupsen/logrus"
 	"go.yaml.in/yaml/v2"
 )
@@ -128,6 +133,213 @@ func setupRegistry(tlsCfg *registryTLSConfig, addr string) (*Registry, error) {
 	}
 	config.Storage = map[string]configuration.Parameters{"inmemory": map[string]any{}}
 	return NewRegistry(context.Background(), config)
+}
+
+// pushBlobForCompressionTest pushes content as a single monolithic upload
+// and returns its digest string.
+func pushBlobForCompressionTest(t *testing.T, client *http.Client, baseURL, repo string, content []byte) string {
+	t.Helper()
+
+	dgst := digest.FromBytes(content)
+
+	resp, err := client.Post(baseURL+"/v2/"+repo+"/blobs/uploads/", "", nil)
+	if err != nil {
+		t.Fatalf("error starting upload: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusAccepted {
+		t.Fatalf("starting upload: unexpected status %d", resp.StatusCode)
+	}
+
+	loc, err := url.Parse(resp.Header.Get("Location"))
+	if err != nil {
+		t.Fatalf("error parsing Location header: %v", err)
+	}
+	base, err := url.Parse(baseURL)
+	if err != nil {
+		t.Fatalf("error parsing base URL: %v", err)
+	}
+	putURL := base.ResolveReference(loc)
+	q := putURL.Query()
+	q.Set("digest", dgst.String())
+	putURL.RawQuery = q.Encode()
+
+	req, err := http.NewRequest(http.MethodPut, putURL.String(), bytes.NewReader(content))
+	if err != nil {
+		t.Fatalf("error creating put request: %v", err)
+	}
+	resp, err = client.Do(req)
+	if err != nil {
+		t.Fatalf("error finishing upload: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("finishing upload: unexpected status %d: %s", resp.StatusCode, body)
+	}
+
+	return dgst.String()
+}
+
+// TestCompression exercises the full NewRegistry handler chain (not just the
+// storage-layer blob serving logic) to guard the two transport-compression
+// fixes: a HEAD request must never receive a Content-Length reflecting the
+// gzip writer's own (empty) stream instead of the real resource size, and
+// the app-wide compression wrapper must still compress ordinary, compressible
+// responses (i.e. the blob route's opt-out doesn't regress compression
+// everywhere else).
+func TestCompression(t *testing.T) {
+	registry, err := setupRegistry(nil, ":0")
+	if err != nil {
+		t.Fatalf("error creating registry: %v", err)
+	}
+
+	ts := httptest.NewServer(registry.server.Handler)
+	defer ts.Close()
+
+	client := &http.Client{Transport: &http.Transport{DisableCompression: true}}
+
+	content := bytes.Repeat([]byte(`{"highly":"compressible"}`), 50)
+	dgst := pushBlobForCompressionTest(t, client, ts.URL, "foo", content)
+
+	t.Run("HEAD blob has an accurate Content-Length and no Content-Encoding", func(t *testing.T) {
+		req, err := http.NewRequest(http.MethodHead, ts.URL+"/v2/foo/blobs/"+dgst, nil)
+		if err != nil {
+			t.Fatalf("error creating request: %v", err)
+		}
+		req.Header.Set("Accept-Encoding", "gzip")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("error doing head request: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if enc := resp.Header.Get("Content-Encoding"); enc != "" {
+			t.Fatalf("expected no Content-Encoding on a HEAD response, got %q", enc)
+		}
+		if got := resp.Header.Get("Content-Length"); got != fmt.Sprint(len(content)) {
+			t.Fatalf("Content-Length = %q, want %d (the real blob size)", got, len(content))
+		}
+	})
+
+	t.Run("GET blob still compresses compressible content", func(t *testing.T) {
+		req, err := http.NewRequest(http.MethodGet, ts.URL+"/v2/foo/blobs/"+dgst, nil)
+		if err != nil {
+			t.Fatalf("error creating request: %v", err)
+		}
+		req.Header.Set("Accept-Encoding", "gzip")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("error doing get request: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if enc := resp.Header.Get("Content-Encoding"); enc != "gzip" {
+			t.Fatalf("expected Content-Encoding: gzip, got %q", enc)
+		}
+
+		gz, err := gzip.NewReader(resp.Body)
+		if err != nil {
+			t.Fatalf("error creating gzip reader: %v", err)
+		}
+		defer gz.Close()
+		got, err := io.ReadAll(gz)
+		if err != nil {
+			t.Fatalf("error decompressing body: %v", err)
+		}
+		if !bytes.Equal(got, content) {
+			t.Fatalf("decompressed body did not match pushed content")
+		}
+	})
+
+	t.Run("GET already-compressed blob is not double-compressed", func(t *testing.T) {
+		var gzipped bytes.Buffer
+		gw := gzip.NewWriter(&gzipped)
+		if _, err := gw.Write([]byte("this stands in for a gzip-compressed tarball layer")); err != nil {
+			t.Fatalf("error writing gzip content: %v", err)
+		}
+		if err := gw.Close(); err != nil {
+			t.Fatalf("error closing gzip writer: %v", err)
+		}
+		gzippedDgst := pushBlobForCompressionTest(t, client, ts.URL, "foo", gzipped.Bytes())
+
+		req, err := http.NewRequest(http.MethodGet, ts.URL+"/v2/foo/blobs/"+gzippedDgst, nil)
+		if err != nil {
+			t.Fatalf("error creating request: %v", err)
+		}
+		req.Header.Set("Accept-Encoding", "gzip")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("error doing get request: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if enc := resp.Header.Get("Content-Encoding"); enc != "" {
+			t.Fatalf("expected no Content-Encoding for an already-compressed blob, got %q", enc)
+		}
+
+		got, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("error reading body: %v", err)
+		}
+		if !bytes.Equal(got, gzipped.Bytes()) {
+			t.Fatalf("body did not match the pushed (already-compressed) content")
+		}
+	})
+
+	t.Run("Range request on a compressible blob is never compressed", func(t *testing.T) {
+		req, err := http.NewRequest(http.MethodGet, ts.URL+"/v2/foo/blobs/"+dgst, nil)
+		if err != nil {
+			t.Fatalf("error creating request: %v", err)
+		}
+		req.Header.Set("Accept-Encoding", "gzip")
+		req.Header.Set("Range", "bytes=0-9")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("error doing get request: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if resp.StatusCode != http.StatusPartialContent {
+			t.Fatalf("expected status 206, got %d", resp.StatusCode)
+		}
+		if enc := resp.Header.Get("Content-Encoding"); enc != "" {
+			t.Fatalf("expected no Content-Encoding on a Range response, got %q", enc)
+		}
+		if got := resp.Header.Get("Content-Length"); got != "10" {
+			t.Fatalf("Content-Length = %q, want 10", got)
+		}
+
+		got, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("error reading body: %v", err)
+		}
+		if !bytes.Equal(got, content[:10]) {
+			t.Fatalf("range body = %q, want %q", got, content[:10])
+		}
+	})
+
+	t.Run("GET /v2/ still compresses under the app-wide handler", func(t *testing.T) {
+		req, err := http.NewRequest(http.MethodGet, ts.URL+"/v2/", nil)
+		if err != nil {
+			t.Fatalf("error creating request: %v", err)
+		}
+		req.Header.Set("Accept-Encoding", "gzip")
+
+		resp, err := client.Do(req)
+		if err != nil {
+			t.Fatalf("error doing get request: %v", err)
+		}
+		defer resp.Body.Close()
+
+		if enc := resp.Header.Get("Content-Encoding"); enc != "gzip" {
+			t.Fatalf("expected Content-Encoding: gzip for the base route, got %q", enc)
+		}
+	})
 }
 
 func TestGracefulShutdown(t *testing.T) {

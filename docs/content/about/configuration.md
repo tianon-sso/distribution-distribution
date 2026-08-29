@@ -1044,6 +1044,16 @@ Useful when deploying the registry behind a load balancer (e.g. Google Cloud Run
 |-----------|----------|-------------------------------------------------------|
 | `enabled` | no      | If `true`, then `h2c` support is enabled.              |
 
+### `compression`
+
+The `compression` structure within `http` is **optional**. Use this to control transport-level
+compression of HTTP responses, negotiated per-request via the client's `Accept-Encoding` header.
+This is enabled by default.
+
+| Parameter | Required | Description                                           |
+|-----------|----------|-------------------------------------------------------|
+| `disabled` | no      | If `true`, then transport-level compression is disabled. |
+
 ## `notifications`
 
 ```yaml

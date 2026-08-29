@@ -184,6 +184,17 @@ type HTTP struct {
 
 	// H2C configures support for HTTP/2 without requiring TLS (HTTP/2 Cleartext).
 	H2C H2C `yaml:"h2c,omitempty"`
+
+	// Compression configures transport-level compression of HTTP responses.
+	Compression Compression `yaml:"compression,omitempty"`
+}
+
+// Compression configures transport-level compression of HTTP responses,
+// negotiated per-request via the client's "Accept-Encoding" header.
+type Compression struct {
+	// Disabled disables transport-level compression of HTTP responses.
+	// Enabled by default.
+	Disabled bool `yaml:"disabled,omitempty"`
 }
 
 // Debug defines the configuration options for the registry's debug interface.

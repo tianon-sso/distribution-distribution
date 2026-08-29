@@ -166,6 +166,9 @@ func NewRegistry(ctx context.Context, config *configuration.Configuration) (*Reg
 		return nil, fmt.Errorf("error during open telemetry initialization: %v", err)
 	}
 	handler = otelHandler(handler)
+	if !config.HTTP.Compression.Disabled {
+		handler = compressHandler(handler)
+	}
 
 	server := &http.Server{
 		Handler:   handler,
