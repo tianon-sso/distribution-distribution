@@ -279,6 +279,19 @@ func (imh *manifestHandler) PutManifest(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	// Repeatable "tag" query parameters atomically tag this manifest in
+	// addition to whatever it's addressed by in the URL (a digest, usually).
+	// https://github.com/opencontainers/distribution-spec/blob/main/spec.md
+	queryTags := r.URL.Query()["tag"]
+	for _, tag := range queryTags {
+		if _, err := reference.WithTag(imh.Repository.Named(), tag); err != nil {
+			imh.Errors = append(imh.Errors, errcode.ErrorCodeTagInvalid.WithDetail(fmt.Sprintf("tag %q: %v", tag, err)))
+		}
+	}
+	if len(imh.Errors) > 0 {
+		return
+	}
+
 	isAnOCIManifest := mediaType == v1.MediaTypeImageManifest || mediaType == v1.MediaTypeImageIndex
 
 	if isAnOCIManifest {
@@ -344,6 +357,24 @@ func (imh *manifestHandler) PutManifest(w http.ResponseWriter, r *http.Request) 
 			return
 		}
 
+	}
+
+	// Apply any tags requested via the "tag" query parameter (validated
+	// above), and confirm each via an OCI-Tag response header.
+	if len(queryTags) > 0 {
+		tags := imh.Repository.Tags(imh)
+		applied := make(map[string]bool, len(queryTags))
+		for _, tag := range queryTags {
+			if tag == imh.Tag || applied[tag] {
+				continue
+			}
+			if err := tags.Tag(imh, tag, desc); err != nil {
+				imh.Errors = append(imh.Errors, errcode.ErrorCodeUnknown.WithDetail(err))
+				return
+			}
+			applied[tag] = true
+			w.Header().Add("OCI-Tag", tag)
+		}
 	}
 
 	// Construct a canonical url for the uploaded manifest.
